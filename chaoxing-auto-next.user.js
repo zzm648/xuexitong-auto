@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星学习通 · 任务点完成自动跳转
 // @namespace    https://dsh.local/chaoxing-auto-next
-// @version      1.9.0
-// @description  监测 studentstudy 页面任务点完成状态，完成后自动进入下一个未完成任务点。只做跳转，不伪造任何进度。面板可拖动，内置可拖动视频进度条。
+// @version      1.10.0
+// @description  监测 studentstudy 页面任务点完成状态，完成后自动进入下一个未完成任务点。只做跳转，不伪造任何进度。面板可拖动，内置可拖动视频进度条，失焦不暂停。
 // @author       dsh
 // @license      MIT
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -35,6 +35,10 @@
  * 7) 面板里的视频进度条可直接拖动：拖动的比例通过 postMessage 发给视频 iframe，
  *    由 iframe 内的脚本设置 video.currentTime，再把真实进度回传给面板。
  *    平台播放器锁住自带进度条时，这个面板进度条仍然可用。
+ * 8) 失焦保护：很多课程会在窗口失焦时 pause() 视频并记一次"切屏"。脚本在失焦
+ *    期间拦截 HTMLMediaElement.prototype.pause，平台调了就忽略，视频继续播；
+ *    再叠一个 pause 事件的兜底续播。要连"请勿切换窗口"弹窗和切屏计数一起挡掉，
+ *    把 cxAutoNext.blockBlur 设为 '1'（默认关，见 README）。
  *
  * 只读取页面状态并模拟点击，不发送任何伪造进度的请求。
  * 想临时改参数：在控制台里改 localStorage 的 cxAutoNext.cfg（JSON）。
@@ -94,6 +98,81 @@
 
   // 默认开启；面板上的"自动播放"开关写的就是这个键
   function autoPlayOn() { return safeGet('cxAutoNext.autoPlay', '1') !== '0'; }
+
+  /* ==================== 失焦保护（顶层 / 子帧共用） ==================== */
+
+  // 默认开启；面板上的"防失焦"开关写的就是这个键
+  function antiBlurOn() { return safeGet('cxAutoNext.antiBlur', '1') !== '0'; }
+  // 默认关闭：连失焦事件本身都挡掉，可能影响站点自身的保存逻辑，按需开
+  function blockBlurOn() { return safeGet('cxAutoNext.blockBlur', '0') === '1'; }
+
+  var FOCUS = { blurred: false };
+
+  // 本帧失焦、标签页不可见、或顶层失焦，都算"用户不在看"
+  function isBlurred() {
+    if (document.hidden) return true;
+    if (FOCUS.blurred) return true;
+    try {
+      if (window.top !== window.self) {
+        if (window.top.__cxAutoNextBlurred) return true;
+        if (window.top.document && window.top.document.hidden) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  /*
+   * 两层防护：
+   *  1) 核心：失焦期间平台调用 video.pause() 直接忽略。不管它是 blur 处理器、
+   *     visibilitychange 处理器还是定时检测调的，最终都要落到 pause() 上。
+   *  2) 可选：把 blur / visibilitychange 事件本身在 window 捕获阶段吞掉，
+   *     让平台的"切屏计数"和"请勿切换窗口"弹窗根本不触发。
+   */
+  function installGuards() {
+    var mark = function (v) {
+      FOCUS.blurred = v;
+      try { window.__cxAutoNextBlurred = v; } catch (e) {}
+    };
+
+    // 先记录真实状态，必须注册在"屏蔽"之前，否则会被自己挡掉
+    window.addEventListener('blur', function () { mark(true); }, true);
+    window.addEventListener('focus', function () { mark(false); }, true);
+    window.addEventListener('visibilitychange', function () { mark(!!document.hidden); }, true);
+    if (window.top === window.self) {
+      try { mark(!document.hasFocus()); } catch (e) {}
+    }
+
+    // 1) 拦截失焦期间的 pause()
+    try {
+      var proto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+      if (proto && !proto.__cxPauseGuarded) {
+        proto.__cxPauseGuarded = true;
+        var rawPause = proto.pause;
+        proto.pause = function () {
+          try {
+            if (antiBlurOn() && isBlurred() && !this.ended && (this.currentTime || 0) > 0.5) {
+              return;   // 忽略这次暂停，视频继续播
+            }
+          } catch (e) {}
+          return rawPause.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // 2) 可选：屏蔽失焦事件
+    if (blockBlurOn()) installBlurShield();
+  }
+
+  function installBlurShield() {
+    var swallow = function (e) {
+      if (!autoPlayOn()) return;
+      if (!document.querySelector('video')) return;
+      try { e.stopImmediatePropagation(); } catch (err) {}
+    };
+    window.addEventListener('blur', swallow, true);
+    window.addEventListener('visibilitychange', swallow, true);
+    try { document.hasFocus = function () { return true; }; } catch (e) {}
+  }
 
   function synthClick(el) {
     if (!el) return;
@@ -277,6 +356,17 @@
         });
         ['timeupdate', 'seeked', 'play', 'pause', 'loadedmetadata', 'durationchange', 'ended']
           .forEach(function (t) { v.addEventListener(t, function () { reportProgress(t === 'seeked' || t === 'ended'); }); });
+
+        // 失焦兜底：万一平台不是走 video.pause()（比如换了 src、走了别的播放器壳），
+        // 只要它在失焦期间被暂停了，这里再拉起来。
+        v.addEventListener('pause', function () {
+          if (v.ended || !antiBlurOn() || !isBlurred()) return;
+          setTimeout(function () {
+            if (v.paused && !v.ended && antiBlurOn() && isBlurred()) {
+              try { v.play(); } catch (e) {}
+            }
+          }, 200);
+        });
       });
 
       mainVideo = pickPrimary(vids);
@@ -300,6 +390,8 @@
       try { v.currentTime = t; } catch (err) {}
       reportProgress(true);
     });
+
+    installGuards();          // 失焦保护要尽早装上，视频一开播就得生效
 
     setInterval(attach, 1500);
     attach();
@@ -656,7 +748,7 @@
     });
 
     /* ---------- HUD ---------- */
-    var hud, elStatus, elBar, elLog, btnToggle, btnSkip, btnRescan, btnDiag, btnAp;
+    var hud, elStatus, elBar, elLog, btnToggle, btnSkip, btnRescan, btnDiag, btnAp, btnAb;
     var hudHooks = { progress: null, reset: null };
 
     function buildHud() {
@@ -674,6 +766,9 @@
         '  <div class="cx-seek" title="拖动调整视频进度">',
         '    <div class="cx-seek-track"><i class="cx-seek-fill"></i><b class="cx-seek-thumb"></b></div>',
         '    <span class="cx-seek-time">视频 --:-- / --:--</span>',
+        '  </div>',
+        '  <div class="cx-guard">',
+        '    <span class="cx-ab" title="失去焦点时不让平台暂停视频">防失焦 开</span>',
         '  </div>',
         '  <div class="cx-btns">',
         '    <button data-act="toggle">暂停</button>',
@@ -718,6 +813,10 @@
         'pointer-events:none}',
         '#cx-auto-next-hud .cx-seek-time{display:block;margin-top:4px;text-align:right;color:#8b98a8;',
         'font-size:11px;font-variant-numeric:tabular-nums}',
+        '#cx-auto-next-hud .cx-guard{display:flex;margin:0 0 8px}',
+        '#cx-auto-next-hud .cx-ab{flex:1;text-align:center;cursor:pointer;padding:2px 0;border-radius:6px;',
+        'background:#2f6b3a;color:#c8f0d2;font-size:11px;border:1px solid transparent}',
+        '#cx-auto-next-hud .cx-ab.off{background:#2b323b;color:#8b98a8;border-color:#48525f}',
         '#cx-auto-next-hud .cx-btns{display:flex;gap:6px}',
         '#cx-auto-next-hud .cx-btns button{flex:1;padding:4px 0;border:1px solid #48525f;border-radius:6px;',
         'background:#2b323b;color:#dfe6ee;cursor:pointer;font-size:12px}',
@@ -736,6 +835,7 @@
       btnRescan = q('[data-act="rescan"]', hud);
       btnDiag = q('[data-act="diag"]', hud);
       btnAp = q('.cx-ap', hud);
+      btnAb = q('.cx-ab', hud);
 
       /* ---------- 小窗拖动 ---------- */
       // 按住标题栏拖动整个面板；位置写进 localStorage，跳章节刷新后还回到原地。
@@ -1101,6 +1201,12 @@
         log(on ? '已开启自动播放' : '已关闭自动播放');
         render();
       });
+      btnAb.addEventListener('click', function () {
+        var on = !antiBlurOn();
+        safeSet('cxAutoNext.antiBlur', on ? '1' : '0');
+        log(on ? '已开启防失焦（失焦不再暂停）' : '已关闭防失焦');
+        render();
+      });
       q('.cx-min', hud).addEventListener('click', function () {
         hud.classList.toggle('collapsed');
         q('.cx-min', hud).textContent = hud.classList.contains('collapsed') ? '+' : '–';
@@ -1163,11 +1269,17 @@
         btnAp.textContent = '自动播放 ' + (ap ? '开' : '关');
         btnAp.classList.toggle('off', !ap);
       }
+      if (btnAb) {
+        var ab = antiBlurOn();
+        btnAb.textContent = '防失焦 ' + (ab ? '开' : '关');
+        btnAb.classList.toggle('off', !ab);
+      }
       // 日志变多会把面板撑高：贴底时要及时往上收，别让下半截掉出视口
       if (hud.__cxClampInView) hud.__cxClampInView();
     }
 
     /* ---------- 启动 ---------- */
+    installGuards();
     buildHud();
     scan();
 
