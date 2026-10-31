@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星学习通 · 任务点完成自动跳转
 // @namespace    https://dsh.local/chaoxing-auto-next
-// @version      1.8.0
-// @description  监测 studentstudy 页面任务点完成状态，完成后自动进入下一个未完成任务点。只做跳转，不伪造任何进度。小窗可拖动，位置自动记住。
+// @version      1.9.0
+// @description  监测 studentstudy 页面任务点完成状态，完成后自动进入下一个未完成任务点。只做跳转，不伪造任何进度。面板可拖动，内置可拖动视频进度条。
 // @author       dsh
 // @license      MIT
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -32,6 +32,9 @@
  *    （ended 事件 + MutationObserver + 媒体事件），后台还会缩短等待直接跳。
  * 6) 右上角小窗按住标题栏即可拖动，位置存 localStorage，跳章节刷新后还在原地；
  *    双击标题栏复位到右上角。
+ * 7) 面板里的视频进度条可直接拖动：拖动的比例通过 postMessage 发给视频 iframe，
+ *    由 iframe 内的脚本设置 video.currentTime，再把真实进度回传给面板。
+ *    平台播放器锁住自带进度条时，这个面板进度条仍然可用。
  *
  * 只读取页面状态并模拟点击，不发送任何伪造进度的请求。
  * 想临时改参数：在控制台里改 localStorage 的 cxAutoNext.cfg（JSON）。
@@ -209,6 +212,8 @@
   function childRole() {
     var lastState = '';
     var lastSent = 0;
+    var lastProg = 0;
+    var mainVideo = null;
 
     function report(state) {
       var now = Date.now();
@@ -231,8 +236,35 @@
       return list;
     }
 
+    function pickPrimary(list) {
+      if (!list || !list.length) return null;
+      var ok = [];
+      list.forEach(function (v) {
+        if (v && v.duration > 0 && isFinite(v.duration)) ok.push(v);
+      });
+      for (var i = 0; i < ok.length; i++) if (!ok[i].paused && !ok[i].ended) return ok[i];
+      return ok[0] || null;
+    }
+
+    // 进度回传：面板上的视频进度条靠它刷新
+    function reportProgress(force) {
+      var v = mainVideo;
+      if (!v) return;
+      var now = Date.now();
+      if (!force && now - lastProg < 250) return;
+      lastProg = now;
+      try {
+        window.top.postMessage({
+          __cxAutoNext: 1, type: 'video', state: 'progress',
+          cur: v.currentTime || 0, dur: v.duration || 0,
+          paused: !!v.paused, t: now
+        }, '*');
+      } catch (e) {}
+    }
+
     function attach() {
-      pickVideos().forEach(function (v) {
+      var vids = pickVideos();
+      vids.forEach(function (v) {
         if (v.__cxBound) return;
         v.__cxBound = true;
         v.addEventListener('ended', function () { report('ended'); });
@@ -243,11 +275,31 @@
           if (!d || !isFinite(d) || d <= 0) return;
           if (v.currentTime / d >= 0.99 || d - v.currentTime <= 1.2) report('ended');
         });
+        ['timeupdate', 'seeked', 'play', 'pause', 'loadedmetadata', 'durationchange', 'ended']
+          .forEach(function (t) { v.addEventListener(t, function () { reportProgress(t === 'seeked' || t === 'ended'); }); });
       });
 
+      mainVideo = pickPrimary(vids);
+
       // 自动播放：新加载的视频（含跳转后这一节）如果停在暂停态就点起来
-      pickVideos().forEach(maybeAutoplay);
+      vids.forEach(maybeAutoplay);
     }
+
+    // 顶层面板拖动进度条时发来的 seek 指令；只接受父窗口的
+    window.addEventListener('message', function (e) {
+      var d = e.data;
+      if (!d || d.__cxAutoNext !== 1 || d.type !== 'cmd') return;
+      if (e.source !== window.parent) return;
+      var v = mainVideo || pickPrimary(pickVideos());
+      if (!v || d.action !== 'seek') return;
+      var dur = v.duration;
+      if (!dur || !isFinite(dur) || dur <= 0) return;
+      var t = (typeof d.ratio === 'number') ? d.ratio * dur : +d.time;
+      if (!isFinite(t)) return;
+      t = Math.max(0, Math.min(dur - 0.05, t));
+      try { v.currentTime = t; } catch (err) {}
+      reportProgress(true);
+    });
 
     setInterval(attach, 1500);
     attach();
@@ -591,17 +643,21 @@
     window.addEventListener('message', function (e) {
       var d = e.data;
       if (!d || d.__cxAutoNext !== 1 || d.type !== 'video') return;
-      if (d.state === 'ended') {
+      if (d.state === 'progress') {
+        if (hudHooks.progress) hudHooks.progress(d, e);
+      } else if (d.state === 'ended') {
         onVideoEnded();
       } else if (d.state === 'unload') {
         // 播放器自己重载（比如切到测验），这次结束信号作废
         endWatch++;
         S.endAt = 0;
+        if (hudHooks.reset) hudHooks.reset();
       }
     });
 
     /* ---------- HUD ---------- */
     var hud, elStatus, elBar, elLog, btnToggle, btnSkip, btnRescan, btnDiag, btnAp;
+    var hudHooks = { progress: null, reset: null };
 
     function buildHud() {
       hud = document.createElement('div');
@@ -615,6 +671,10 @@
         '<div class="cx-body">',
         '  <div class="cx-status">初始化…</div>',
         '  <div class="cx-bar"><i></i></div>',
+        '  <div class="cx-seek" title="拖动调整视频进度">',
+        '    <div class="cx-seek-track"><i class="cx-seek-fill"></i><b class="cx-seek-thumb"></b></div>',
+        '    <span class="cx-seek-time">视频 --:-- / --:--</span>',
+        '  </div>',
         '  <div class="cx-btns">',
         '    <button data-act="toggle">暂停</button>',
         '    <button data-act="skip">下一个</button>',
@@ -646,6 +706,18 @@
         '#cx-auto-next-hud .cx-status{min-height:34px;word-break:break-all;color:#c9d4e0}',
         '#cx-auto-next-hud .cx-bar{height:4px;background:#333a44;border-radius:2px;overflow:hidden;margin:6px 0 8px}',
         '#cx-auto-next-hud .cx-bar i{display:block;height:100%;width:0;background:#39d353;transition:width .3s}',
+        '#cx-auto-next-hud .cx-seek{margin:0 0 8px}',
+        '#cx-auto-next-hud .cx-seek.disabled{opacity:.45}',
+        '#cx-auto-next-hud .cx-seek-track{position:relative;height:8px;border-radius:4px;background:#333a44;',
+        'cursor:pointer;touch-action:none}',
+        '#cx-auto-next-hud .cx-seek.disabled .cx-seek-track{cursor:default}',
+        '#cx-auto-next-hud .cx-seek-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#4c8dff;',
+        'border-radius:4px;pointer-events:none}',
+        '#cx-auto-next-hud .cx-seek-thumb{position:absolute;top:50%;left:0;width:10px;height:10px;',
+        'margin:-5px 0 0 -5px;border-radius:50%;background:#e9eef6;box-shadow:0 0 0 2px rgba(76,141,255,.3);',
+        'pointer-events:none}',
+        '#cx-auto-next-hud .cx-seek-time{display:block;margin-top:4px;text-align:right;color:#8b98a8;',
+        'font-size:11px;font-variant-numeric:tabular-nums}',
         '#cx-auto-next-hud .cx-btns{display:flex;gap:6px}',
         '#cx-auto-next-hud .cx-btns button{flex:1;padding:4px 0;border:1px solid #48525f;border-radius:6px;',
         'background:#2b323b;color:#dfe6ee;cursor:pointer;font-size:12px}',
@@ -820,6 +892,191 @@
       window.addEventListener('resize', clampInView);
       // 拖动中切走窗口，避免 mouseup 丢失后一直卡在拖动状态
       window.addEventListener('blur', function () { if (drag.on) onUp(); });
+
+      /* ---------- 视频进度条 ---------- */
+      // 进度由视频 iframe 通过 postMessage 回传；拖动时反过来把 seek 指令发过去。
+      var seekWrap = q('.cx-seek', hud);
+      var seekTrack = q('.cx-seek-track', hud);
+      var seekFill = q('.cx-seek-fill', hud);
+      var seekThumb = q('.cx-seek-thumb', hud);
+      var seekTime = q('.cx-seek-time', hud);
+
+      var VID = { win: null, origin: '', cur: 0, dur: 0, dragging: false, lastSent: 0 };
+
+      function fmtTime(s) {
+        if (!isFinite(s) || s < 0) s = 0;
+        s = Math.floor(s);
+        var h = Math.floor(s / 3600);
+        var m = Math.floor((s % 3600) / 60);
+        var sec = s % 60;
+        function p2(n) { return n < 10 ? '0' + n : '' + n; }
+        return (h ? h + ':' + p2(m) : p2(m)) + ':' + p2(sec);
+      }
+
+      function paintSeek(ratio) {
+        ratio = clampNum(ratio || 0, 0, 1);
+        var pct = (ratio * 100).toFixed(2) + '%';
+        if (seekFill) seekFill.style.width = pct;
+        if (seekThumb) seekThumb.style.left = pct;
+        var disabled = !(VID.dur > 0);
+        if (seekWrap) seekWrap.classList.toggle('disabled', disabled);
+        if (seekTime) {
+          seekTime.textContent = disabled
+            ? '视频 --:-- / --:--'
+            : '视频 ' + fmtTime(ratio * VID.dur) + ' / ' + fmtTime(VID.dur);
+        }
+      }
+
+      function topVideo() {
+        var list = qa('video');
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].duration > 0 && !list[i].ended) return list[i];
+        }
+        return list[0] || null;
+      }
+
+      // 知道是哪个窗口在放视频就发给它；不确定时广播给播放器候选 iframe
+      function seekTargets() {
+        var out = [];
+        function add(w) {
+          if (!w) return;
+          for (var i = 0; i < out.length; i++) if (out[i] === w) return;
+          out.push(w);
+        }
+        add(VID.win);
+        qa('iframe').forEach(function (f) {
+          var src = f.getAttribute('src') || '';
+          if (f.id === 'iframe' || /ananas|mooc-ans/i.test(src)) {
+            try { if (f.contentWindow) add(f.contentWindow); } catch (e) {}
+          }
+        });
+        return out;
+      }
+
+      function sendSeek(ratio) {
+        if (!(VID.dur > 0)) return;
+        ratio = clampNum(ratio, 0, 1);
+        var t = ratio * VID.dur;
+        var msg = { __cxAutoNext: 1, type: 'cmd', action: 'seek', time: t, ratio: ratio };
+        var to = VID.origin && VID.origin !== 'null' ? VID.origin : '*';
+        seekTargets().forEach(function (w) {
+          try { w.postMessage(msg, to); } catch (e) {}
+        });
+        // 视频直接挂在顶层页面（没有播放器 iframe）的情况
+        var v = topVideo();
+        if (v) {
+          try { v.currentTime = Math.max(0, Math.min(t, (v.duration || t) - 0.05)); } catch (e) {}
+        }
+        VID.cur = t;
+      }
+
+      function seekRatioFromEvent(e) {
+        var r = seekTrack.getBoundingClientRect();
+        if (!r || !r.width) return 0;
+        var p = evPoint(e);
+        if (!p || p.clientX == null) return 0;
+        return clampNum((p.clientX - r.left) / r.width, 0, 1);
+      }
+
+      var seekDrag = { on: false, ratio: 0 };
+
+      function bindSeekDoc(on) {
+        var fn = on ? addDoc : delDoc;
+        if (window.PointerEvent) {
+          fn('pointermove', onSeekMove, CAP_OPT);
+          fn('pointerup', onSeekUp, CAP_OPT);
+          fn('pointercancel', onSeekUp, CAP_OPT);
+        } else {
+          fn('mousemove', onSeekMove, CAP_OPT);
+          fn('mouseup', onSeekUp, CAP_OPT);
+          fn('touchmove', onSeekMove, TOUCH_OPT);
+          fn('touchend', onSeekUp, TOUCH_OPT);
+          fn('touchcancel', onSeekUp, TOUCH_OPT);
+        }
+      }
+
+      function onSeekDown(e) {
+        if (!(VID.dur > 0)) return;
+        if (e.button != null && e.button !== 0) return;
+        seekDrag.on = true;
+        VID.dragging = true;
+        seekDrag.ratio = seekRatioFromEvent(e);
+        paintSeek(seekDrag.ratio);
+        sendSeek(seekDrag.ratio);
+        VID.lastSent = Date.now();
+        if (window.PointerEvent) {
+          try {
+            if (e.pointerId != null && seekTrack.setPointerCapture) seekTrack.setPointerCapture(e.pointerId);
+          } catch (e2) {}
+        }
+        bindSeekDoc(true);
+        if (e.cancelable) { try { e.preventDefault(); } catch (e2) {} }
+      }
+
+      function onSeekMove(e) {
+        if (!seekDrag.on) return;
+        seekDrag.ratio = seekRatioFromEvent(e);
+        paintSeek(seekDrag.ratio);
+        var now = Date.now();
+        if (now - VID.lastSent >= 80) {
+          VID.lastSent = now;
+          sendSeek(seekDrag.ratio);
+        }
+        if (e.cancelable) { try { e.preventDefault(); } catch (e2) {} }
+      }
+
+      function onSeekUp() {
+        if (!seekDrag.on) return;
+        seekDrag.on = false;
+        VID.dragging = false;
+        sendSeek(seekDrag.ratio);
+        bindSeekDoc(false);
+        paintSeek(seekDrag.ratio);
+      }
+
+      function onSeekEl(type, fn, opts) {
+        try { seekTrack.addEventListener(type, fn, opts); }
+        catch (e) { seekTrack.addEventListener(type, fn, false); }
+      }
+      if (window.PointerEvent) {
+        onSeekEl('pointerdown', onSeekDown);
+      } else {
+        onSeekEl('mousedown', onSeekDown);
+        onSeekEl('touchstart', onSeekDown, TOUCH_OPT);
+      }
+      window.addEventListener('blur', function () { if (seekDrag.on) onSeekUp(); });
+
+      // 顶层直接挂 video 的页面：没有子帧回传，自己定时刷新
+      setInterval(function () {
+        if (VID.win) return;
+        var v = topVideo();
+        if (!v || !(v.duration > 0)) return;
+        VID.dur = v.duration;
+        VID.cur = v.currentTime || 0;
+        if (!VID.dragging) paintSeek(VID.cur / VID.dur);
+      }, 500);
+
+      hudHooks.progress = function (d, e) {
+        if (e && e.source) VID.win = e.source;
+        if (e && e.origin) VID.origin = e.origin;
+        var dur = +d.dur || 0;
+        var cur = +d.cur || 0;
+        if (dur > 0) {
+          VID.dur = dur;
+          VID.cur = cur;
+          if (!VID.dragging) paintSeek(cur / dur);
+        } else if (!VID.dragging && !(VID.dur > 0)) {
+          paintSeek(0);
+        }
+      };
+      hudHooks.reset = function () {
+        VID.win = null;
+        VID.dur = 0;
+        VID.cur = 0;
+        if (!VID.dragging) paintSeek(0);
+      };
+
+      paintSeek(0);
 
       btnToggle.addEventListener('click', function () {
         S.enabled = !S.enabled;
